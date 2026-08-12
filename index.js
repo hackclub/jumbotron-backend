@@ -10,10 +10,9 @@ const app = express();
 app.use(express.json());
 app.use(cors({
     origin: [
-        "https://curly-bassoon-6vrjgqpjpjjhwj6-5173.app.github.dev",
+        "https://cuddly-space-waffle-jjv54wrjpjxvfqj55-5173.app.github.dev",
         "https://jumbotron.hackclub.com",
         "https://hacklyn.city",
-        "https://expert-giggle-x5pj6x9pww4jf69vw-5173.app.github.dev"
     ],
     methods: [
         "POST", "GET"
