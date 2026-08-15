@@ -302,7 +302,7 @@ app.use(["/mutate", "/terminateLiveshare"], express.text({ type: "text/plain" })
 });
 app.post("/wipeSessions", async (req, res) => {
     let {authKey} = req.body;
-    if (!authKey) {
+    if (!authKey || authKey !== masterKey) {
         return res.status(401).json({error: "Not allowed"});
     }
     sessions = [];
