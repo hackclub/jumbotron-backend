@@ -9,17 +9,26 @@ const masterKey = process.env.MASTER;
 const app = express();
 app.use(express.json());
 app.use(cors({
-    origin: [
-        "https://cuddly-space-waffle-jjv54wrjpjxvfqj55-5173.app.github.dev",
-        "https://jumbotron.hackclub.com",
-        "https://hacklyn.city",
-    ],
-    methods: [
-        "POST", "GET"
-    ],
+    origin: (origin, callback) => {
+        // Allow requests with no origin (like mobile apps, curl, server-to-server)
+        if (!origin) return callback(null, true);
+
+        const allowedOrigins = [
+            "https://jumbotron.hackclub.com",
+            "https://hacklyn.city",
+        ];
+
+        // Match static domains or ANY github.dev subdomain
+        if (allowedOrigins.includes(origin) || origin.endsWith('.github.dev') || origin.startsWith('http://localhost:')) {
+            return callback(null, true);
+        } else {
+            return callback(null, false);
+        }
+    },
+    methods: ["POST", "GET"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true
-}))
+}));
 
 let validCitiesCache = [];
 let pocEmailsCache = [];
@@ -217,7 +226,7 @@ app.use(["/mutate", "/terminateLiveshare"], express.text({ type: "text/plain" })
 });
 app.post("/wipeSessions", async (req, res) => {
     let {authKey} = req.body;
-    if (!authKey) {
+    if (!authKey || authKey !== masterKey) {
         return res.status(401).json({error: "Not allowed"});
     }
     sessions = [];
