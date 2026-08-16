@@ -24,93 +24,6 @@ app.use(cors({
 let validCitiesCache = [];
 let pocEmailsCache = [];
 
-let refList = [
-    {
-        "eventName": "NYC",
-        "poc": "shreyatodi3@gmail.com"
-    },
-    {
-        "eventName": "San Francisco",
-        "poc": "alisal.singyee@gmail.com"
-    },
-    {
-        "eventName": "Austin",
-        "poc": "lisedo147@gmail.com"
-    },
-    {
-        "eventName": "Miami",
-        "poc": "alisal.singyee@gmail.com"
-    },
-    {
-        "eventName": "Atlanta",
-        "poc": "charmwoodrum@gmail.com"
-    },
-    {
-        "eventName": "Bogota",
-        "poc": "beesfanalt@gmail.com"
-    },
-    {
-        "eventName": "Boston",
-        "poc": "vivithequeen1@gmail.com"
-    },
-    {
-        "eventName": "Houston",
-        "poc": "madison.o.mayer@gmail.com"
-    },
-    {
-        "eventName": "London",
-        "poc": "aishahisap123@gmail.com"
-    },
-    {
-        "eventName": "Minneapolis",
-        "poc": "spam@mediaology.com"
-    },
-    {
-        "eventName": "Dhaka",
-        "poc": "nosrathjahan16@gmail.com"
-    },
-    {
-        "eventName": "DC",
-        "poc": "rosed.20104@gmail.com"
-    },
-    {
-        "eventName": "Sacramento",
-        "poc": "bonilla.ellie@gmail.com"
-    },
-    {
-        "eventName": "Seattle",
-        "poc": "shsuri15@gmail.com"
-    },
-    {
-        "eventName": "Tampa",
-        "poc": "caitlindu10@gmail.com"
-    },
-    {
-        "eventName": "Milwaukee",
-        "poc": "saanvi4800@gmail.com"
-    },
-    {
-        "eventName": "Charlotte",
-        "poc": "taymonayc@gmail.com"
-    },
-    {
-        "eventName": "Dallas",
-        "poc": "suhanisharma072@gmail.com"
-    },
-    {
-        "eventName": "Dundee",
-        "poc": "yahannahsu@gmail.com"
-    },
-    {
-        "eventName": "Hong Kong",
-        "poc": "lu-cindy@outlook.com"
-    },
-    {
-        "eventName": "Victoria",
-        "poc": "sanadeghat@gmail.com"
-    }
-]
-
 let events = [];
 let sessions = [];
 
@@ -120,9 +33,11 @@ async function cacheCities() {
     try {
         //const rawData = await fetch("https://raw.githubusercontent.com/lynn89-eefje/jumbotron-events/refs/heads/main/data.json");
         //const data = await rawData.json();
-        let data = refList;
-        validCitiesCache = data.map(event => event.eventName);
-        pocEmailsCache = data.map(event => event.poc);
+        let data = process.env.REF.split("*");
+        validCitiesCache = data.map(event => event.split(";")[0]);
+        pocEmailsCache = data.map(event => event.split(";")[1].split(","))
+        //validCitiesCache = data.map(event => event.split("*").split(";")[0]);
+        //pocEmailsCache = data.map(event => event.split("*").split(";")[1].split(","));
         console.log("Cached events");
     } catch(err) {
         console.error("Failed to cache cities: ", err);
