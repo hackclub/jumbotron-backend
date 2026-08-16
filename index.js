@@ -36,8 +36,6 @@ async function cacheCities() {
         let data = process.env.REF.split("*");
         validCitiesCache = data.map(event => event.split(";")[0]);
         pocEmailsCache = data.map(event => event.split(";")[1].split(","))
-        //validCitiesCache = data.map(event => event.split("*").split(";")[0]);
-        //pocEmailsCache = data.map(event => event.split("*").split(";")[1].split(","));
         console.log("Cached events");
     } catch(err) {
         console.error("Failed to cache cities: ", err);
@@ -61,7 +59,7 @@ function ensureEvent(eventName) {
     if (!event) {
         event = { 
             name: eventName, 
-            acceptedEmails: [pocEmailsCache[validCitiesCache.indexOf(eventName)]],
+            acceptedEmails: pocEmailsCache[validCitiesCache.indexOf(eventName)],
             liveshareData: {} 
         };
         events.push(event);
