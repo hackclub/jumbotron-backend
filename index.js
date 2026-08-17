@@ -11,8 +11,7 @@ app.use(express.json());
 app.use(cors({
     origin: [
         "https://cuddly-space-waffle-jjv54wrjpjxvfqj55-5173.app.github.dev",
-        "https://jumbotron.hackclub.com",
-        "https://hacklyn.city",
+        "https://jumbotron.hackclub.com"
     ],
     methods: [
         "POST", "GET"
@@ -69,6 +68,36 @@ function ensureEvent(eventName) {
         event.name, event.acceptedEmails, event.liveshareData
     ];
 }
+
+function timeDiff(timestamp) {
+    if (timestamp == null) {
+        return true;
+    }
+    let clock = new Date();
+    let curr = clock.getTime();
+    let diff = curr - timestamp;
+    diff = diff/1000/60;
+    if (diff > 30) {
+        return true
+    }
+    return false;
+}
+
+function cleanUp() {
+    //let events = events.fitler(x => x.liveshareData.active != false);
+    for (let i in events) {
+        if (streams[events[i].cityName] == null || streams[events[i].cityName] == []) {
+            if (events[i].liveshareData.active == false || timeDiff(events[i].liveshareData.timestamp) == true) {
+                console.log(`Removing ${events[i].cityName} to clear memory`)
+                events = events.filter(e => e.cityName != events[i].cityName);
+            }
+        }
+    }
+}
+
+
+setInterval(cleanUp, 1000*60*5);
+
 
 async function sendDataToSlack() {
     const slackToken = process.env.BOT_TOKEN;
@@ -203,7 +232,7 @@ app.post("/removeEmail", async (req, res) => {
         }
     }
 })
-app.use(["/mutate", "/terminateLiveshare"], express.text({ type: "text/plain" }), (req, res, next) => {
+app.use(["/mutate", "/terminateLiveshare"], express.text({ type: ["text/plain", "*/*"] }), (req, res, next) => {
     if (typeof req.body === "string" && req.body.trim().startsWith("{")) {
         try {
             req.body = JSON.parse(req.body);
@@ -211,6 +240,8 @@ app.use(["/mutate", "/terminateLiveshare"], express.text({ type: "text/plain" })
             console.error("Failed to parse plain-text JSON beacon:", err);
         }
     }
+    // Ensure req.body is at least an object if parsing didn't occur
+    req.body = req.body || {};
     next();
 });
 app.post("/wipeSessions", async (req, res) => {
@@ -374,6 +405,7 @@ app.post("/createSession", async (req, res) => {
         cityName: cityName,
         key: key
     })
+    console.log(`Created new login session for ${data2.identity.primary_email}, ${cityName}`)
     //console.log("New session validated for ", data2.identity.primary_email);
     return res.status(200).json({emailAddress: data2.identity.primary_email, key: key});
 })
@@ -426,7 +458,7 @@ const port = process.env.PORT || 3000;
 setInterval(async () => {
     await sendDataToSlack();
     //await cacheCities();
-}, 10*1000*60)
+}, 30*1000*60)
 
 app.listen(port, function() {
     console.log(`Jumbotron running on port ${port}`);
