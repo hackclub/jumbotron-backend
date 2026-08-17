@@ -89,19 +89,30 @@ function timeDiff(timestamp) {
 }
 
 function cleanUp() {
+    /*
+    If not active and there are no streams, we remove the city
+    If not active but there are streams, we set it to inactive and remove wasted data
+    */
     let toRemove = [];
     for (let i in events) {
-        if (streams[events[i].name] === null || streams[events[i].name] == null || streams[events[i].name].length == 0) {
-            if (events[i].liveshareData.active == false && timeDiff(events[i].liveshareData.timestamp) == true) {
+        if (streams[events[i].name] == null || streams[events[i].name].length == 0) {
+            if (events[i].liveshareData.active == false || timeDiff(events[i].liveshareData.timestamp) == true) {
                 console.log(`Removing ${events[i].name} to clear memory`)
                 toRemove.push(events[i].name);
             }
         }
+        else {
+            if (events[i].liveshareData.active == false && timeDiff(events[i].liveshareData.timestamp) == true) {
+                console.log(`Deactivating ${events[i].name} to clear memory`)
+                events[i].liveshareData = {
+                    "active": false,
+                    "timestamp": Date.getTime()
+                }
+            }
+        }
     }
     events = events.filter(e => toRemove.indexOf(e.name) == -1);
-    cleanUp = false;
 }
-
 
 setInterval(cleanUp, 1000*60*5);
 
@@ -459,13 +470,13 @@ function broadcastToCity(cityName, data) {
 
 // --- Server Startup ---
 await cacheCities();
-await sendDataToSlack();
+//await sendDataToSlack();
 const port = process.env.PORT || 3000; 
 
-setInterval(async () => {
+/*setInterval(async () => {
     await sendDataToSlack();
     //await cacheCities();
-}, 30*1000*60)
+}, 30*1000*60)*/
 
 app.listen(port, function() {
     console.log(`Jumbotron running on port ${port}`);
