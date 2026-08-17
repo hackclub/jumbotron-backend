@@ -55,11 +55,15 @@ function ensureEvent(eventName) {
     let event = events.find(e => e.name === eventName);
 
     // If it doesn't exist, create it and push it to the list
+    let clock = new Date();
     if (!event) {
         event = { 
             name: eventName, 
             acceptedEmails: pocEmailsCache[validCitiesCache.indexOf(eventName)],
-            liveshareData: {} 
+            liveshareData: {
+                active: false,
+                timestamp: clock.getTime()
+            } 
         };
         events.push(event);
     }
@@ -77,22 +81,24 @@ function timeDiff(timestamp) {
     let curr = clock.getTime();
     let diff = curr - timestamp;
     diff = diff/1000/60;
-    if (diff > 30) {
+    if (diff > 20) {
         return true
     }
     return false;
 }
 
 function cleanUp() {
-    //let events = events.fitler(x => x.liveshareData.active != false);
+    let toRemove = [];
     for (let i in events) {
-        if (streams[events[i].cityName] == null || streams[events[i].cityName] == []) {
-            if (events[i].liveshareData.active == false || timeDiff(events[i].liveshareData.timestamp) == true) {
-                console.log(`Removing ${events[i].cityName} to clear memory`)
-                events = events.filter(e => e.cityName != events[i].cityName);
+        if (streams[events[i].name] === null || streams[events[i].name] == null || streams[events[i].name].length == 0) {
+            if (events[i].liveshareData.active == false && timeDiff(events[i].liveshareData.timestamp) == true) {
+                console.log(`Removing ${events[i].name} to clear memory`)
+                toRemove.push(events[i].name);
             }
         }
     }
+    events = events.filter(e => toRemove.indexOf(e.name) == -1);
+
 }
 
 
