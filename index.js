@@ -35,7 +35,6 @@ async function cacheCities() {
         let data = process.env.REF.split("*");
         validCitiesCache = data.map(event => event.split(";")[0]);
         pocEmailsCache = data.map(event => event.split(";")[1].split(","))
-        pocEmailsCache = pocEmailsCache.filter(email => email.indexOf("@events.hackclub.com") == -1);
         console.log("Cached events");
     } catch(err) {
         console.error("Failed to cache cities: ", err);
@@ -82,7 +81,7 @@ function timeDiff(timestamp) {
     let curr = clock.getTime();
     let diff = curr - timestamp;
     diff = diff/1000/60;
-    if (diff > 20) {
+    if (diff > 30) {
         return true
     }
     return false;
@@ -114,7 +113,7 @@ function cleanUp() {
     events = events.filter(e => toRemove.indexOf(e.name) == -1);
 }
 
-setInterval(cleanUp, 1000*60*5);
+setInterval(cleanUp, 1000*60*15);
 
 
 async function sendDataToSlack() {
