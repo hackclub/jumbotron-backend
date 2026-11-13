@@ -11,8 +11,20 @@ console.log("Set admin list", admins)
 
 let banned = [];
 
+// Bans set by environment variables, read at startup. They can't be lifted from the admin panel;
+// set the variable to false (or remove it) and restart to lift one. Nothing else stores them,
+// so a lifted env ban leaves no trace.
+const envTrue = (v) => /^(1|true|yes|on)$/i.test(String(v ?? "").trim());
+const envBans = new Set();
+if (envTrue(process.env.BAN_SHREYA)) envBans.add("U0A1CJ987EH");
+if (envBans.size) console.log("Bans from env", [...envBans]);
+
 const app = express();
-app.set("trust proxy", "loopback");
+// Rate limits go by client IP, so this must match the deployment: behind a proxy that isn't on
+// loopback, every client would otherwise look like the proxy and share one limit.
+// TRUST_PROXY: a hop count ("1"), "true", or addresses/subnets ("loopback, 10.0.0.0/8").
+const trustProxy = process.env.TRUST_PROXY ?? "loopback";
+app.set("trust proxy", /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy === "true" ? true : trustProxy);
 // /demoFrame carries a JPEG in its JSON body, so it gets its own, larger limit (see below).
 const parseJson = express.json();
 app.use((req, res, next) => (req.path === "/demoFrame" ? next() : parseJson(req, res, next)));
@@ -64,7 +76,7 @@ function codeGen(token) {
 function randomGen() {
     let code = "";
     for (let i = 0; i <= 3; i++) {
-        code += Math.floor(Math.random() * 9) + 1;
+        code += crypto.randomInt(1, 10);
     }
     if (tokens[code]) {
         return randomGen();
@@ -82,7 +94,7 @@ function logAs(code, ...msg) {
 }
 
 function isBanned(slack) {
-    return banned.indexOf(slack) != -1;
+    return envBans.has(slack) || banned.indexOf(slack) != -1;
 }
 
 // Looks up an event by a caller-supplied code. Only own keys count: a bare `tokens[code]`
@@ -622,7 +634,8 @@ app.post("/sendPacket", async function (req, res) {
 });
 
 app.get("/getPacket", async function (req, res) {
-    const code = req.query.code != null ? String(req.query.code) : "";
+    const code = lookupCode(req, res, req.query.code);
+    if (code == null) return;
     if (!code) {
         return res.status(400).json({ error: "Missing event code" });
     }
@@ -637,7 +650,8 @@ app.get("/getPacket", async function (req, res) {
 });
 
 app.get("/getSession", async function(req, res) {
-    const code = req.query.code != null ? String(req.query.code) : "";
+    const code = lookupCode(req, res, req.query.code);
+    if (code == null) return;
     if (!code) {
         return res.status(400).json({ error: "No event code provided" });
     }
@@ -896,6 +910,11 @@ function getDemo(code) {
     return d;
 }
 
+const SCREEN_MISS_PER_DEVICE = 5;        // a minute
+const SCREEN_MISS_PER_IP = 30;           // a minute
+const SCREEN_ROTATE_AFTER = 20;          // wrong guesses at one event...
+const SCREEN_ROTATE_WINDOW = 10 * 60 * 1000;   // ...within this long
+
 function newScreenCode() {
     return String(crypto.randomInt(0, 10000)).padStart(4, "0");
 }
@@ -988,22 +1007,79 @@ function approveWhileBusy(current) {
     return "replace";
 }
 
-// Wrong screen codes, per caller and per event, within the last minute. Four digits are only
-// safe if guessing is slow.
-const DEMO_FAIL_WINDOW = 60 * 1000;
-let demoFailures = new Map();   // key -> [timestamps]
+// --- Rate limits ---
+//
+// Only wrong guesses count: people who type the right code are never slowed down. Nothing here
+// locks out a whole event or the whole site, because anyone could trigger that on purpose; the
+// limits are per client, and the only per-event response to a flood of guesses is a new code.
 
-function recentFailures(key) {
+let attempts = new Map();   // key -> [timestamps]
+const ATTEMPT_KEEP = 60 * 60 * 1000;
+
+function recent(key, windowMs) {
     const now = Date.now();
-    const list = (demoFailures.get(key) || []).filter(t => now - t < DEMO_FAIL_WINDOW);
-    if (list.length) demoFailures.set(key, list);
-    else demoFailures.delete(key);
-    return list;
+    const list = (attempts.get(key) || []).filter(t => now - t < ATTEMPT_KEEP);
+    if (list.length) attempts.set(key, list);
+    else attempts.delete(key);
+    return list.filter(t => now - t < windowMs).length;
+}
+
+function bump(key) {
+    recent(key, 0);
+    attempts.set(key, [...(attempts.get(key) || []), Date.now()]);
+}
+
+// Event codes are short so people can type them, which makes them guessable. A client that
+// keeps trying codes that don't exist is cut off from looking up codes it hasn't used yet.
+// Codes it (or anyone on its network) already opened keep working: at a venue, where everyone
+// shares one IP, the event's own code is already known by the time anyone could abuse it, so a
+// troll can't lock the room out of its own event.
+const LOOKUP_MISS_MAX = 30;
+const LOOKUP_WINDOW = 10 * 60 * 1000;
+const KNOWN_CODE_TTL = 24 * 60 * 60 * 1000;
+const KNOWN_CODES_PER_IP = 50;
+let knownCodes = new Map();   // ip -> Map(code -> last used)
+
+function isKnownCode(ip, code) {
+    const seen = knownCodes.get(ip);
+    const at = seen && seen.get(code);
+    return !!at && Date.now() - at < KNOWN_CODE_TTL;
+}
+
+function rememberCode(ip, code) {
+    const seen = knownCodes.get(ip) || new Map();
+    seen.delete(code);
+    seen.set(code, Date.now());
+    while (seen.size > KNOWN_CODES_PER_IP) seen.delete(seen.keys().next().value);
+    knownCodes.set(ip, seen);
+}
+
+// For endpoints anyone can call with an event code. Returns the code, or null after answering
+// 429. Endpoints still answer "not found" themselves.
+function lookupCode(req, res, raw) {
+    const code = raw != null ? String(raw) : "";
+    if (!code) return code;
+    const ip = req.ip;
+    const known = isKnownCode(ip, code);
+    if (!known && recent(`lookup|${ip}`, LOOKUP_WINDOW) >= LOOKUP_MISS_MAX) {
+        res.status(429).json({ error: "Too many codes that don't exist. Wait a few minutes and try again." });
+        return null;
+    }
+    if (getToken(code)) rememberCode(ip, code);
+    else if (!known) bump(`lookup|${ip}`);
+    return code;
 }
 
 setInterval(() => {
-    for (const key of [...demoFailures.keys()]) recentFailures(key);
-}, DEMO_FAIL_WINDOW).unref();
+    for (const key of [...attempts.keys()]) recent(key, 0);
+    const now = Date.now();
+    for (const [ip, seen] of knownCodes) {
+        for (const [code, at] of seen) {
+            if (now - at >= KNOWN_CODE_TTL) seen.delete(code);
+        }
+        if (!seen.size) knownCodes.delete(ip);
+    }
+}, 5 * 60 * 1000).unref();
 
 function demoPresenter(code, token) {
     const d = demos.get(String(code ?? ""));
@@ -1136,7 +1212,9 @@ app.post("/demoFrame", express.json({ limit: "600kb" }), async function (req, re
 
 // Public, like /getSession: anyone with the event code can watch the big screen's demo.
 app.get("/demoFrame", async function (req, res) {
-    const code = req.query.code != null ? rootOf(req.query.code) : "";
+    const raw = lookupCode(req, res, req.query.code);
+    if (raw == null) return;
+    const code = rootOf(raw);
     const d = getToken(code) ? demos.get(code) : null;
     if (!mirrorState(code)) return res.status(404).json({ error: "Nothing is being mirrored" });
     // The URL carries the frame number, so any one frame never changes.
@@ -1177,7 +1255,9 @@ function dropViewers(code, reason) {
 const validViewer = (id) => typeof id === "string" && /^[A-Za-z0-9-]{8,64}$/.test(id);
 
 app.get("/mirrorStream", async function (req, res) {
-    const code = req.query.code != null ? rootOf(req.query.code) : "";
+    const raw = lookupCode(req, res, req.query.code);
+    if (raw == null) return;
+    const code = rootOf(raw);
     const viewer = req.query.viewer;
     if (!getToken(code) || !validViewer(viewer)) return res.status(400).json({ error: "Bad request" });
     const d = demos.get(code);
@@ -1202,7 +1282,9 @@ app.get("/mirrorStream", async function (req, res) {
 // A watcher's handshake message (their offer or ICE candidates) on its way to the projector.
 app.post("/mirrorSignal", async function (req, res) {
     const body = req.body || {};
-    const code = body.code != null ? rootOf(body.code) : "";
+    const raw = lookupCode(req, res, body.code);
+    if (raw == null) return;
+    const code = rootOf(raw);
     const d = getToken(code) ? demos.get(code) : null;
     if (!validViewer(body.viewer) || !validSignal(body.signal)) return res.status(400).json({ error: "Invalid signal" });
     if (!d || !d.viewers.has(body.viewer) || !mirrorLive(d)) return res.status(409).json({ delivered: false });
@@ -1302,7 +1384,9 @@ const DEMO_QUEUE_MAX = 50;
 // Joins the queue. Needs a typed name and the code on the big screen.
 app.post("/demoJoin", async function (req, res) {
     const body = req.body || {};
-    const code = body.code != null ? rootOf(body.code) : "";
+    const raw = lookupCode(req, res, body.code);
+    if (raw == null) return;
+    const code = rootOf(raw);
     const screenCode = body.screenCode != null ? String(body.screenCode).trim() : "";
     if (!code || !screenCode) {
         return res.status(400).json({ error: "Enter the code on the big screen." });
@@ -1325,13 +1409,22 @@ app.post("/demoJoin", async function (req, res) {
         return res.status(409).json({ error: "The big screen isn't connected yet. Ask an organizer." });
     }
 
-    const callerKey = `${code}|${req.ip}`;
-    if (recentFailures(callerKey).length >= 5 || recentFailures(code).length >= 30) {
+    // Wrong screen codes: a few a minute per browser, more per network (a venue shares one), and
+    // a burst of them against one event just changes the code on the big screen.
+    const deviceKey = `screen|${code}|${who.id}`;
+    const ipKey = `screen|${code}|${req.ip}`;
+    if (recent(deviceKey, 60 * 1000) >= SCREEN_MISS_PER_DEVICE || recent(ipKey, 60 * 1000) >= SCREEN_MISS_PER_IP) {
         return res.status(429).json({ error: "Too many wrong codes. Wait a minute and try again." });
     }
     if (!safeEqual(d.screenCode, screenCode)) {
-        for (const key of [callerKey, code]) {
-            demoFailures.set(key, [...recentFailures(key), Date.now()]);
+        bump(deviceKey);
+        bump(ipKey);
+        bump(`screen|${code}`);
+        if (recent(`screen|${code}`, SCREEN_ROTATE_WINDOW) >= SCREEN_ROTATE_AFTER) {
+            d.screenCode = newScreenCode();
+            attempts.delete(`screen|${code}`);
+            notifyDemo(code);
+            logAs(code, "Changed the screen code after repeated wrong guesses");
         }
         return res.status(401).json({ error: "That's not the code on the big screen." });
     }
@@ -1477,10 +1570,12 @@ app.post("/demoSignal", async function (req, res) {
 // Unpairing replaces the key, which signs every paired computer out.
 
 const PAIR_TTL = 10 * 60 * 1000;
+const PAIR_MISS_MAX = 10;
+const PAIR_MISS_WINDOW = 10 * 60 * 1000;
 
 function newPairCode() {
     let p;
-    do p = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+    do p = String(crypto.randomInt(0, 100000000)).padStart(8, "0");
     while (pairCodes.has(p));
     return p;
 }
@@ -1510,16 +1605,17 @@ app.post("/screenPairCode", async function (req, res) {
 
 app.post("/screenPair", async function (req, res) {
     const pairCode = req.body && req.body.pairCode != null ? String(req.body.pairCode).replace(/\D/g, "") : "";
+    // Pairing hands over a big screen, so wrong guesses are limited hard, but only per network:
+    // a site-wide limit would let anyone stop every venue from pairing. Eight digits keeps a
+    // guess from many networks at once hopeless.
     const callerKey = `pair|${req.ip}`;
-    if (recentFailures(callerKey).length >= 5 || recentFailures("pair").length >= 60) {
-        return res.status(429).json({ error: "Too many wrong codes. Wait a minute and try again." });
+    if (recent(callerKey, PAIR_MISS_WINDOW) >= PAIR_MISS_MAX) {
+        return res.status(429).json({ error: "Too many wrong codes. Wait a few minutes and try again." });
     }
     const entry = pairCodes.get(pairCode);
     const token = entry && entry.expires > Date.now() ? getToken(entry.code) : undefined;
     if (!token || !token.screenKey || isBanned(token.slack)) {
-        for (const key of [callerKey, "pair"]) {
-            demoFailures.set(key, [...recentFailures(key), Date.now()]);
-        }
+        bump(callerKey);
         return res.status(401).json({ error: "That code didn't work. Codes last 10 minutes; get a new one from the organizer console." });
     }
     pairCodes.delete(pairCode);
@@ -1676,6 +1772,9 @@ app.post("/unbanEvent", async function (req, res) {
         return res.status(400).json({ error: "Missing Slack ID" });
     }
 
+    if (envBans.has(unbanSlack)) {
+        return res.status(409).json({ error: "That ban is set by the server's environment. Turn it off there and restart." });
+    }
     banned = banned.filter(x => x != unbanSlack);
     logAs(code, `Unbanned ${unbanSlack}`);
     return res.status(200).json({ message: "Unbanned user" });
