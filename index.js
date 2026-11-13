@@ -11,6 +11,20 @@ console.log("Set admin list", admins)
 
 let banned = [];
 
+// Bans set by environment variables. Unlike `banned` (managed from the admin panel) these can't
+// be lifted or replaced through the API; only a redeploy without the variable lifts them.
+const envTrue = (v) => /^(1|true|yes|on)$/i.test(String(v ?? "").trim());
+const permanentBans = new Set();
+if (envTrue(process.env.BAN_SHREYA)) permanentBans.add("U0A1CJ987EH");
+if (permanentBans.size) console.log("Permanent bans from env", [...permanentBans]);
+
+// Partial bans by Slack ID: slack -> Set of scopes. Signing in still works.
+//   organize: can't be added as (or stay) an organizer of someone else's event
+//   host:     can't publish or run an event (content, name, demo time, harpa, pairing, invites)
+const RESTRICTION_SCOPES = ["organize", "host"];
+let restrictions = new Map();
+const isRestricted = (slack, scope) => !!(restrictions.get(slack) && restrictions.get(slack).has(scope));
+
 const app = express();
 app.set("trust proxy", "loopback");
 // /demoFrame carries a JPEG in its JSON body, so it gets its own, larger limit (see below).
@@ -81,8 +95,18 @@ function logAs(code, ...msg) {
     console.log(t ? tokenLog(t.slack, t.name) : `[${code}]`, ...msg);
 }
 
+function randomPassword() {
+    const randarray = new Uint8Array(16);
+    crypto.getRandomValues(randarray);
+    let out = "";
+    for (let i = 0; i < randarray.length; i++) {
+        out += "" + randarray[i];
+    }
+    return out;
+}
+
 function isBanned(slack) {
-    return banned.indexOf(slack) != -1;
+    return permanentBans.has(slack) || banned.indexOf(slack) != -1;
 }
 
 // Looks up an event by a caller-supplied code. Only own keys count: a bare `tokens[code]`
@@ -193,6 +217,18 @@ function authAdmin(req, res) {
         return null;
     }
     return code;
+}
+
+// Answers 403 when the organizer making this request (`req.actor` for event endpoints) has a
+// partial ban on `scope`. Returns true when the request was refused.
+function refuseRestricted(req, res, code, scope) {
+    const actor = req.actor || code;
+    const t = tokens[actor];
+    if (!t || !isRestricted(t.slack, scope)) return false;
+    res.status(403).json({ error: scope === "host"
+        ? "An administrator has stopped you from running events."
+        : "An administrator has stopped you from organizing other events." });
+    return true;
 }
 
 // --- SSE plumbing ---
@@ -385,6 +421,7 @@ function mergeInto(root, member) {
     // The member's own big screen, demo queue and harpa give way to the shared ones. A big
     // screen tab it had open reconnects and comes back as the shared screen.
     closeDemo(member, { type: "moved" });
+    demoBlocks.delete(member);
     harpaOn.delete(member);
 
     // Invites: the one that brought `member` in (if any) is spent; other events' invites to
@@ -430,6 +467,7 @@ function purgeEvent(code, endPayload, why = "banned") {
     for (const res of sessions[code] || []) sseEnd(res, endPayload);
     closeOrgStreams(code, { type: "revoked", reason: why });
     closeDemo(code, { type: "revoked", reason: why });
+    demoBlocks.delete(code);
     harpaOn.delete(code);
     for (const [ticket, v] of streamTickets) {
         if (v.code === code) streamTickets.delete(ticket);
@@ -528,12 +566,7 @@ app.post("/genToken", async function(req, res) {
         });
     }
 
-    const randarray = new Uint8Array(16);
-    crypto.getRandomValues(randarray);
-    let cryptoCode = "";
-    for (let i = 0; i < randarray.length; i++) {
-        cryptoCode += "" + randarray[i];
-    }
+    const cryptoCode = randomPassword();
 
     let newToken = {};
     newToken.name = scopes.first_name;
@@ -553,6 +586,7 @@ app.post("/genToken", async function(req, res) {
 app.post("/initEvent", async function (req, res) {
     const code = authOrganizer(req, res);
     if (code == null) return;
+    if (refuseRestricted(req, res, code, "host")) return;
     const { cityName } = req.body;
     if (!cityName || typeof cityName !== "string") {
         return res.status(400).json({ error: "Missing parameter(s)" });
@@ -588,6 +622,7 @@ function parsePacket(raw) {
 app.post("/sendPacket", async function (req, res) {
     const code = authOrganizer(req, res);
     if (code == null) return;
+    if (refuseRestricted(req, res, code, "host")) return;
     const { packet, changed, tab } = req.body;
     if (!packet) {
         return res.status(400).json({ error: "Missing parameter(s)" });
@@ -779,6 +814,7 @@ const INVITES_MAX = 25;
 app.post("/mergeInvite", async function (req, res) {
     const code = authOrganizer(req, res);
     if (code == null) return;
+    if (refuseRestricted(req, res, code, "host")) return;
     const slack = req.body.slack != null ? String(req.body.slack).trim().toUpperCase() : "";
 
     if (!/^[UW][A-Z0-9]{6,15}$/.test(slack)) {
@@ -789,6 +825,9 @@ app.post("/mergeInvite", async function (req, res) {
     }
     if (isBanned(slack)) {
         return res.status(403).json({ error: "You can't add that person." });
+    }
+    if (isRestricted(slack, "organize")) {
+        return res.status(403).json({ error: "That person can't organize other events right now." });
     }
     const root = getRootCode(code);
     const target = eventBySlack(slack);
@@ -845,6 +884,10 @@ app.post("/respondMergeInvite", async function (req, res) {
         return res.status(200).json(mergeState(code));
     }
 
+    if (isRestricted(tokens[code].slack, "organize")) {
+        dropInvite(inv, "invite_unavailable", null);
+        return res.status(403).json({ error: "An administrator has stopped you from organizing other events." });
+    }
     const hostToken = getToken(host);
     if (!hostToken || hostToken.bridge || isBanned(hostToken.slack)) {
         dropInvite(inv, "invite_unavailable", null);
@@ -900,6 +943,14 @@ function newScreenCode() {
     return String(crypto.randomInt(0, 10000)).padStart(4, "0");
 }
 
+// Presenters an organizer blocked from demo time: root code -> Map(blockId -> { who, name }).
+// Presenters aren't signed in, so this goes by the browser's device id. It isn't by IP on
+// purpose: a venue's wifi often puts every attendee behind the same address.
+let demoBlocks = new Map();
+
+const blockedList = (code) => [...(demoBlocks.get(code) || new Map())].map(([id, b]) => ({ id, name: b.name }));
+const isBlocked = (code, who) => [...(demoBlocks.get(code) || new Map()).values()].some(b => b.who === who);
+
 // A presenter is "live" once they've picked a window and their feed is connected.
 const isLive = (p) => !!(p && p.picked && p.res);
 
@@ -907,7 +958,7 @@ const isLive = (p) => !!(p && p.picked && p.res);
 function demoState(code) {
     const d = demos.get(code);
     const paired = !!(tokens[code] && tokens[code].screenKey);
-    if (!d) return { enabled: false, board: true, mirror: false, screenCode: null, screenOpen: false, paired, presenter: null, queue: [] };
+    if (!d) return { enabled: false, board: true, mirror: false, screenCode: null, screenOpen: false, paired, presenter: null, queue: [], blocked: blockedList(code) };
     const p = d.presenter;
     return {
         paired,   // some computer has been paired: the console offers to sign them out
@@ -917,7 +968,8 @@ function demoState(code) {
         screenCode: d.enabled ? d.screenCode : null,
         screenOpen: !!d.screen,
         presenter: p ? { id: p.id, name: p.name, slack: p.slack, picked: p.picked, live: isLive(p) } : null,
-        queue: d.queue.map(q => ({ id: q.id, name: q.name, slack: q.slack, connected: !!q.res }))
+        queue: d.queue.map(q => ({ id: q.id, name: q.name, slack: q.slack, connected: !!q.res })),
+        blocked: blockedList(code)
     };
 }
 
@@ -1051,6 +1103,7 @@ app.post("/demoState", async function (req, res) {
 app.post("/demoSet", async function (req, res) {
     const code = authEvent(req, res);
     if (code == null) return;
+    if (refuseRestricted(req, res, code, "host")) return;
     const { enabled, board, mirror } = req.body;
     if ((enabled != null && typeof enabled !== "boolean") || (board != null && typeof board !== "boolean") ||
         (mirror != null && typeof mirror !== "boolean") || (enabled == null && board == null && mirror == null)) {
@@ -1225,6 +1278,7 @@ app.post("/demoStop", async function (req, res) {
 app.post("/demoApprove", async function (req, res) {
     const code = authEvent(req, res);
     if (code == null) return;
+    if (refuseRestricted(req, res, code, "host")) return;
     const d = demos.get(code);
     const entry = d && d.queue.find(q => q.id === String(req.body.id ?? ""));
     if (!entry) {
@@ -1264,6 +1318,43 @@ app.post("/demoRemove", async function (req, res) {
     if (entry) {
         dropQueued(code, entry, "removed");
         logAs(req.actor || code, `Removed ${entry.name} from the demo queue`);
+    }
+    return res.status(200).json({ demo: demoState(code) });
+});
+
+// Takes someone off the big screen or out of the queue and keeps them from joining again.
+app.post("/demoBlock", async function (req, res) {
+    const code = authEvent(req, res);
+    if (code == null) return;
+    const d = demos.get(code);
+    const id = String(req.body.id ?? "");
+    const entry = d && ((d.presenter && d.presenter.id === id && d.presenter) || d.queue.find(q => q.id === id));
+    if (!entry) {
+        return res.status(404).json({ error: "They're no longer on the big screen or in the queue." });
+    }
+    const blocks = demoBlocks.get(code) || new Map();
+    if (blocks.size >= 200) {
+        return res.status(409).json({ error: "Too many blocked presenters. Unblock some first." });
+    }
+    blocks.set(crypto.randomBytes(6).toString("hex"), { who: entry.who, name: entry.name });
+    demoBlocks.set(code, blocks);
+    if (d.presenter === entry) endPresenter(code, "blocked");
+    else dropQueued(code, entry, "blocked");
+    logAs(req.actor || code, `Blocked ${entry.name} from demo time`);
+    return res.status(200).json({ demo: demoState(code) });
+});
+
+app.post("/demoUnblock", async function (req, res) {
+    const code = authEvent(req, res);
+    if (code == null) return;
+    const blocks = demoBlocks.get(code);
+    const id = String(req.body.id ?? "");
+    const block = blocks && blocks.get(id);
+    if (block) {
+        blocks.delete(id);
+        if (!blocks.size) demoBlocks.delete(code);
+        notifyDemo(code);
+        logAs(req.actor || code, `Unblocked ${block.name} from demo time`);
     }
     return res.status(200).json({ demo: demoState(code) });
 });
@@ -1320,6 +1411,9 @@ app.post("/demoJoin", async function (req, res) {
     const d = demos.get(code);
     if (!d || !d.enabled) {
         return res.status(409).json({ error: "Demo time isn't on right now." });
+    }
+    if (isBlocked(code, who.id)) {
+        return res.status(403).json({ error: "An organizer removed you from demo time." });
     }
     if (!d.screen) {
         return res.status(409).json({ error: "The big screen isn't connected yet. Ask an organizer." });
@@ -1495,6 +1589,7 @@ setInterval(() => {
 app.post("/screenPairCode", async function (req, res) {
     const code = authEvent(req, res);
     if (code == null) return;
+    if (refuseRestricted(req, res, code, "host")) return;
     // One live pairing code per event: asking again replaces it.
     for (const [p, v] of pairCodes) {
         if (v.code === code) pairCodes.delete(p);
@@ -1676,6 +1771,9 @@ app.post("/unbanEvent", async function (req, res) {
         return res.status(400).json({ error: "Missing Slack ID" });
     }
 
+    if (permanentBans.has(unbanSlack)) {
+        return res.status(409).json({ error: "That ban is set by the server's environment. Remove it there and redeploy." });
+    }
     banned = banned.filter(x => x != unbanSlack);
     logAs(code, `Unbanned ${unbanSlack}`);
     return res.status(200).json({ message: "Unbanned user" });
@@ -1685,9 +1783,75 @@ async function getBans(req, res) {
     const code = authAdmin(req, res);
     if (code == null) return;
 
-    return res.status(200).json({ list: JSON.stringify(banned) });
+    return res.status(200).json({
+        list: JSON.stringify(banned),
+        permanent: [...permanentBans],
+        restrictions: Object.fromEntries([...restrictions].map(([slack, set]) => [slack, [...set]]))
+    });
 }
 app.route("/getBans").get(getBans).post(getBans);
+
+// --- Kicks and partial bans (admins) ---
+
+const slackParam = (raw) => (raw != null ? String(raw).trim().toUpperCase() : "");
+const codesOf = (slack) => Object.keys(tokens).filter(c => tokens[c].slack === slack);
+
+// Signs someone out everywhere right now without banning them: their password is replaced, so
+// every console and big screen they opened stops working until they sign in again.
+function kickUser(slack) {
+    const codes = codesOf(slack);
+    for (const c of codes) {
+        tokens[c].password = randomPassword();
+        for (const [ticket, v] of streamTickets) {
+            if (v.code === c) streamTickets.delete(ticket);
+        }
+        closeOrgStreams(c, { type: "revoked", reason: "kicked" });
+        const d = demos.get(getRootCode(c));
+        // A screen they opened signed in as them; a paired venue computer belongs to the event.
+        if (d && d.screen && d.screen.openedBy === c && !d.screen.paired) sseEnd(d.screen, { type: "revoked", reason: "kicked" });
+    }
+    kickAttendee(slack);
+    return codes.length;
+}
+
+app.post("/kickUser", async function (req, res) {
+    const code = authAdmin(req, res);
+    if (code == null) return;
+    const slack = slackParam(req.body.slack);
+    if (!slack) return res.status(400).json({ error: "Missing Slack ID" });
+    if (admins.includes(slack)) return res.status(409).json({ error: "Admins can't be kicked." });
+    const count = kickUser(slack);
+    logAs(code, `Kicked ${slack}`);
+    return res.status(200).json({ message: count ? `Signed ${slack} out everywhere.` : `${slack} wasn't signed in.` });
+});
+
+// { slack, scope: "organize" | "host", restricted: boolean }
+app.post("/restrictUser", async function (req, res) {
+    const code = authAdmin(req, res);
+    if (code == null) return;
+    const slack = slackParam(req.body.slack);
+    const { scope, restricted } = req.body;
+    if (!slack || !RESTRICTION_SCOPES.includes(scope) || typeof restricted !== "boolean") {
+        return res.status(400).json({ error: `Send slack, scope (${RESTRICTION_SCOPES.join(" or ")}) and restricted as true or false` });
+    }
+    if (admins.includes(slack)) return res.status(409).json({ error: "Admins can't be restricted." });
+
+    const set = restrictions.get(slack) || new Set();
+    if (restricted) set.add(scope);
+    else set.delete(scope);
+    if (set.size) restrictions.set(slack, set);
+    else restrictions.delete(slack);
+
+    if (restricted && scope === "organize") {
+        // Out of any event they help organize, and no invites left to accept.
+        for (const c of codesOf(slack)) {
+            if (tokens[c].bridge) unmerge(c, "member_restricted");
+        }
+        for (const inv of invitesTo(slack)) dropInvite(inv, "invite_unavailable", null);
+    }
+    logAs(code, `${restricted ? "Restricted" : "Lifted restriction on"} ${slack} from ${scope}`);
+    return res.status(200).json({ restrictions: [...(restrictions.get(slack) || [])] });
+});
 
 async function getAdmins(req, res) {
     const code = authOrganizer(req, res);
@@ -1710,6 +1874,7 @@ function harpaState(code) {
 app.post("/harpaSet", async function (req, res) {
     const code = authEvent(req, res);
     if (code == null) return;
+    if (refuseRestricted(req, res, code, "host")) return;
     const enabled = req.body && req.body.enabled;
     if (typeof enabled !== "boolean") return res.status(400).json({ error: "Send enabled as true or false" });
     if (harpaOn.has(code) !== enabled) {
