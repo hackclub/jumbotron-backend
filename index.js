@@ -402,9 +402,9 @@ function unmerge(member, reason) {
     const root = tokens[member] && tokens[member].bridge;
     if (!root) return;
     delete tokens[member].bridge;
-    // Give the departing event the shared screen's last state so its participants don't
-    // jump back to whatever it showed before merging.
-    packets[member] = packets[root] ?? packets[member] ?? null;
+    // The departing event goes back to its own content: packets[member] was left alone while
+    // it was merged (everything was published to the root), so nothing from the shared event
+    // follows it out.
     syncSources(root);
     syncSources(member);
     pushToParticipants([member]);
@@ -415,20 +415,21 @@ function unmerge(member, reason) {
     notifyOrg(member, reason);
 }
 
-// Removes an event entirely (bans). Its members become standalone roots.
-function purgeEvent(code, endPayload) {
+// Removes an event entirely (a ban, or its organizer deleting it). Its members become
+// standalone roots. `why` is "banned" or "deleted".
+function purgeEvent(code, endPayload, why = "banned") {
     for (const inv of invitesFrom(code)) dropInvite(inv, null, "invite_unavailable");
     for (const inv of invitesTo(tokens[code].slack)) dropInvite(inv, "invite_unavailable", null);
     for (const [p, v] of pairCodes) {
         if (v.code === code) pairCodes.delete(p);
     }
-    for (const m of getMembers(code)) unmerge(m, "host_removed");
+    for (const m of getMembers(code)) unmerge(m, why === "deleted" ? "host_deleted" : "host_removed");
     // From the host's side a banned member simply leaves.
     if (tokens[code].bridge) unmerge(code, "member_left");
 
     for (const res of sessions[code] || []) sseEnd(res, endPayload);
-    closeOrgStreams(code, { type: "revoked", reason: "banned" });
-    closeDemo(code, { type: "revoked", reason: "banned" });
+    closeOrgStreams(code, { type: "revoked", reason: why });
+    closeDemo(code, { type: "revoked", reason: why });
     harpaOn.delete(code);
     for (const [ticket, v] of streamTickets) {
         if (v.code === code) streamTickets.delete(ticket);
@@ -571,7 +572,9 @@ app.post("/initEvent", async function (req, res) {
 });
 
 // What a packet may carry. `announcement` is the newest announcement, for older attendee tabs.
-const PACKET_KEYS = ["announcements", "announcement", "event", "file", "youtube", "website"];
+// `announcementsHidden` keeps the list while organizers have announcements switched off, so
+// switching them back on restores it. Attendee views ignore it.
+const PACKET_KEYS = ["announcements", "announcement", "announcementsHidden", "event", "file", "youtube", "website"];
 
 function parsePacket(raw) {
     try {
@@ -730,6 +733,16 @@ app.get("/orgStream", async function (req, res) {
         set.delete(res);
         if (set.size == 0) orgStreams.delete(code);
     });
+});
+
+// An organizer deletes their own event: its code, name, content, big screen and invites. Other
+// organizers go back to their own events; signing in again starts a fresh event.
+app.post("/deleteEvent", async function (req, res) {
+    const code = authOrganizer(req, res);
+    if (code == null) return;
+    logAs(code, "Deleted their event");
+    purgeEvent(code, { error: "This event has ended" }, "deleted");
+    return res.status(200).json({ message: "Event deleted" });
 });
 
 app.post("/mergeState", async function (req, res) {
