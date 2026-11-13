@@ -31,22 +31,27 @@ app.use(cors({
 
 let clientID = "e86d4d7eec9c546e6c4700388d4fea7f";
 
-// tokens[code] = { name, slack, password, cityName?, bridge?, sources? }
+// tokens[code] = { name, slack, password, cityName?, bridge?, sources?, screenKey? }
 //   `bridge` is the single source of truth for merges: a bridged event points at its root.
 //   `sources` (root only) is a derived list of member Slack IDs, kept for the admin JSON export.
+//   `screenKey` lets paired venue computers run this event's big screen without the organizer's
+//   password (see "Screen pairing").
 let tokens = {};
 let packets = {};
 let sessions = {};               // participant SSE streams, keyed by the code they connected with
-let mergeRequests = new Map();   // requesterCode -> { from, to, createdAt }
+// Invites to organize an event, by Slack ID: the invitee may not have signed in yet, so there
+// may be no event to point at. It shows up on their console whenever they do. `from` is always
+// the event's root, whichever of its organizers sent it.
+let mergeInvites = new Map();    // `${hostCode}|${slack}` -> { from, slack, createdAt }
+let pairCodes = new Map();       // short-lived screen pairing code -> { code, expires }
 let orgStreams = new Map();      // organizer code -> Set<res> (the /orgStream SSE feeds)
-// Demo time (participant screenshare), keyed by the event's own code: every venue has its own
-// projector, so merged events still present separately.
+// Demo time (participant screenshare), keyed by the root event's code: an event's organizers
+// share one big screen and one queue.
 //   demos.get(code) = { enabled, board, screenCode, screen: res|null, presenter: entry|null, queue: [entry] }
 //   entry = { id, who, name, slack, token, res, timer, pickTimer, picked }
 //   `board` shows the announcement and up next on the big screen; off, it only carries demos.
 let demos = new Map();
-// Events whose big screen shows harpa (hackclub/harpa, embedded). Keyed by the event's own code
-// like demo time: every venue has its own projector.
+// Events whose big screen shows harpa (hackclub/harpa, embedded). Keyed by root code, like demos.
 let harpaOn = new Set();
 
 function codeGen(token) {
@@ -139,6 +144,45 @@ function authOrganizer(req, res) {
         return null;
     }
     return code;
+}
+
+// Like authOrganizer, but a paired big screen may also sign in with { code, screenKey }.
+// Only the big screen's own endpoints accept it.
+function authScreen(req, res) {
+    const body = req.body || {};
+    if (body.password != null || body.screenKey == null) return authOrganizer(req, res);
+    const code = body.code != null ? String(body.code) : "";
+    const token = getToken(code);
+    if (!token || !token.screenKey || !safeEqual(token.screenKey, body.screenKey)) {
+        res.status(401).json({ error: "This screen isn't paired with an event anymore" });
+        return null;
+    }
+    if (isBanned(token.slack)) {
+        res.status(401).json({ error: "Banned user" });
+        return null;
+    }
+    return code;
+}
+
+// The event an organizer acts on: their own, or the one they help organize. Big screen, demo
+// time and harpa are per event, so their endpoints use this.
+// `req.actor` keeps who did it, for the logs.
+function authEvent(req, res) {
+    const code = authOrganizer(req, res);
+    req.actor = code;
+    return code == null ? null : getRootCode(code);
+}
+
+function authEventScreen(req, res) {
+    const code = authScreen(req, res);
+    req.actor = code;
+    return code == null ? null : getRootCode(code);
+}
+
+// An attendee-supplied event code, resolved to the event it shows.
+function rootOf(raw) {
+    const code = String(raw ?? "");
+    return getToken(code) ? getRootCode(code) : code;
 }
 
 function authAdmin(req, res) {
@@ -248,20 +292,44 @@ function publicEvent(code) {
     return { code, name: t.name, slack: t.slack, cityName: t.cityName || null };
 }
 
-// Everything an organizer's merge UI needs, from that organizer's point of view.
+function eventBySlack(slack) {
+    const found = Object.entries(tokens).find(([, t]) => t.slack === slack);
+    return found ? found[0] : null;
+}
+
+const inviteKey = (host, slack) => `${host}|${slack}`;
+const invitesFrom = (host) => [...mergeInvites.values()].filter(i => i.from === host);
+const invitesTo = (slack) => [...mergeInvites.values()].filter(i => i.slack === slack);
+
+// Removes one invite and tells both sides (the invitee only if they have an event).
+function dropInvite(inv, hostReason, inviteeReason) {
+    if (!mergeInvites.delete(inviteKey(inv.from, inv.slack))) return;
+    if (hostReason) notifyGroup(inv.from, hostReason);
+    const invitee = eventBySlack(inv.slack);
+    if (inviteeReason && invitee) notifyOrg(invitee, inviteeReason);
+}
+
+// Everything an organizer's Organizers panel needs, from that organizer's point of view.
+// Organizers share one event: the root ("bridged" organizers' own events point at it).
 function mergeState(code) {
     const root = getRootCode(code);
     const bridged = root !== code;
-    const outgoing = mergeRequests.get(code);
     return {
         code,
         role: bridged ? "bridged" : "root",
         root: publicEvent(root),
         members: getMembers(root).map(publicEvent),
-        incoming: bridged ? [] : [...mergeRequests.values()]
-            .filter(r => r.to === code)
-            .map(r => ({ ...publicEvent(r.from), createdAt: r.createdAt })),
-        outgoing: outgoing ? { ...publicEvent(outgoing.to), createdAt: outgoing.createdAt } : null
+        // Invites out from this event, by any of its organizers. `name`/`code` are null until
+        // the invitee signs in.
+        invitesSent: invitesFrom(root).map(i => {
+            const c = eventBySlack(i.slack);
+            return { slack: i.slack, name: c ? tokens[c].name : null, code: c, createdAt: i.createdAt };
+        }),
+        // Invites waiting for this organizer, shown even while bridged or hosting so they know
+        // what to undo before accepting.
+        invites: invitesTo(tokens[code].slack)
+            .filter(i => getToken(i.from))
+            .map(i => ({ ...publicEvent(i.from), createdAt: i.createdAt }))
     };
 }
 
@@ -286,9 +354,10 @@ function closeOrgStreams(code, payload) {
 function participantPayload(code) {
     const root = getRootCode(code);
     return {
+        code: root,   // the code to show for joining (an organizer's own code leads here too)
         data: packets[root] ?? null,
-        demos: !!(demos.get(code) && demos.get(code).enabled),
-        mirror: mirrorState(code),
+        demos: !!(demos.get(root) && demos.get(root).enabled),
+        mirror: mirrorState(root),
         cityName: (tokens[root] && tokens[root].cityName) || (tokens[code] && tokens[code].cityName) || null
     };
 }
@@ -305,44 +374,27 @@ function pushToParticipants(codes) {
     return count;
 }
 
-function dropRequest(from, reason) {
-    const r = mergeRequests.get(from);
-    if (!r) return;
-    mergeRequests.delete(from);
-    notifyOrg(r.from, reason);
-    notifyOrg(r.to, reason);
-}
-
-function dropRequestsInvolving(code, reason) {
-    for (const r of [...mergeRequests.values()]) {
-        if (r.from === code || r.to === code) dropRequest(r.from, reason);
-    }
-}
-
+// `member` becomes an organizer of `root`'s event.
 function mergeInto(root, member) {
-    mergeRequests.delete(member);
     tokens[member].bridge = root;
     delete tokens[member].sources;
 
     syncSources(root);
     pushToParticipants([member]);
 
-    // A bridged event can't host, and a root that now has members can't merge out.
-    // Only the requesting side is told about requests to `member`: the member itself must see
-    // just "merged", not a "your target merged elsewhere" notice about its own merge.
-    // Delete-then-notify one request at a time so each push carries exactly one change;
-    // clients ignore pushes identical to the state they already hold.
-    for (const r of [...mergeRequests.values()]) {
-        if (r.to !== member) continue;
-        mergeRequests.delete(r.from);
-        if (r.from !== root) notifyOrg(r.from, "target_merged_elsewhere");
-    }
-    const rootOutgoing = mergeRequests.get(root);
-    if (rootOutgoing) {
-        mergeRequests.delete(root);
-        notifyOrg(rootOutgoing.to, "request_cancelled");
-        notifyOrg(root, "outgoing_cancelled");
-    }
+    // The member's own big screen, demo queue and harpa give way to the shared ones. A big
+    // screen tab it had open reconnects and comes back as the shared screen.
+    closeDemo(member, { type: "moved" });
+    harpaOn.delete(member);
+
+    // Invites: the one that brought `member` in (if any) is spent; other events' invites to
+    // `member` can't be accepted while it organizes this one; and invites out of `member`'s own
+    // event are withdrawn.
+    const memberSlack = tokens[member].slack;
+    mergeInvites.delete(inviteKey(root, memberSlack));
+    for (const inv of invitesTo(memberSlack)) dropInvite(inv, "invite_unavailable", null);
+    for (const inv of invitesFrom(member)) dropInvite(inv, null, "invite_cancelled");
+
     notifyGroup(root, "merged");
 }
 
@@ -356,13 +408,20 @@ function unmerge(member, reason) {
     syncSources(root);
     syncSources(member);
     pushToParticipants([member]);
+    // A big screen this organizer opened was the shared one; it reconnects as their own.
+    const d = demos.get(root);
+    if (d && d.screen && d.screen.openedBy === member) sseEnd(d.screen, { type: "moved" });
     notifyGroup(root, reason);
     notifyOrg(member, reason);
 }
 
 // Removes an event entirely (bans). Its members become standalone roots.
 function purgeEvent(code, endPayload) {
-    dropRequestsInvolving(code, "target_unavailable");
+    for (const inv of invitesFrom(code)) dropInvite(inv, null, "invite_unavailable");
+    for (const inv of invitesTo(tokens[code].slack)) dropInvite(inv, "invite_unavailable", null);
+    for (const [p, v] of pairCodes) {
+        if (v.code === code) pairCodes.delete(p);
+    }
     for (const m of getMembers(code)) unmerge(m, "host_removed");
     // From the host's side a banned member simply leaves.
     if (tokens[code].bridge) unmerge(code, "member_left");
@@ -499,7 +558,8 @@ app.post("/initEvent", async function (req, res) {
     }
 
     if (tokens[code].bridge) {
-        return res.status(400).json({ error: "Bridged events cannot initialize events; only root events can set location." });
+        const host = getToken(tokens[code].bridge);
+        return res.status(409).json({ error: `Your event uses ${host ? `${host.name}'s` : "the host's"} name while merged. Only the host can rename it.` });
     }
 
     tokens[code].cityName = cityName.trim();
@@ -510,21 +570,52 @@ app.post("/initEvent", async function (req, res) {
     return res.status(200).json({ message: `Set ${cityName} as location visible to participants` });
 });
 
+// What a packet may carry. `announcement` is the newest announcement, for older attendee tabs.
+const PACKET_KEYS = ["announcements", "announcement", "event", "file", "youtube", "website"];
+
+function parsePacket(raw) {
+    try {
+        const p = typeof raw === "string" ? JSON.parse(raw) : raw;
+        return p && typeof p === "object" && !Array.isArray(p) ? p : null;
+    } catch (e) {
+        return null;
+    }
+}
+
 app.post("/sendPacket", async function (req, res) {
     const code = authOrganizer(req, res);
     if (code == null) return;
-    const { packet } = req.body;
+    const { packet, changed, tab } = req.body;
     if (!packet) {
         return res.status(400).json({ error: "Missing parameter(s)" });
     }
 
-    // Bridged organizers co-host: their updates drive the root's shared screen.
+    // Organizers share the root event's content.
     const rootCode = getRootCode(code);
-    packets[rootCode] = packet;
+
+    // With `changed`, only those keys replace what's there, so two organizers publishing
+    // different things don't undo each other. Without it (older consoles) the packet replaces all.
+    let next = packet;
+    let keys = PACKET_KEYS;
+    if (Array.isArray(changed)) {
+        const incoming = parsePacket(packet);
+        if (!incoming) return res.status(400).json({ error: "Packet must be a JSON object" });
+        keys = PACKET_KEYS.filter(k => changed.includes(k));
+        const merged = parsePacket(packets[rootCode]) || {};
+        for (const k of keys) merged[k] = incoming[k] ?? null;
+        merged.timestamp = Date.now();
+        next = JSON.stringify(merged);
+    }
+    packets[rootCode] = next;
 
     const count = pushToParticipants(groupCodes(rootCode));
-    logAs(code, `Updated information based on ${packet}${count ? ` and broadcasted to ${count} users` : ""}`);
-    return res.status(200).json({ message: `Updated information${count ? ` and broadcasted to ${count} users` : ""}` });
+    // Every organizer console of this event sees the change (`tab` lets the sender skip its echo).
+    const push = { type: "packet", data: next, tab: typeof tab === "string" ? tab.slice(0, 64) : null };
+    for (const c of groupCodes(rootCode)) {
+        for (const s of orgStreams.get(c) || []) sseWrite(s, push);
+    }
+    logAs(code, `Updated ${Array.isArray(changed) ? keys.join(", ") || "nothing" : "everything"}${count ? ` and broadcast to ${count} users` : ""}`);
+    return res.status(200).json({ message: `Updated information${count ? ` and broadcasted to ${count} users` : ""}`, packet: next });
 });
 
 app.get("/getPacket", async function (req, res) {
@@ -578,7 +669,7 @@ const STREAM_TICKET_TTL = 30 * 1000;
 let streamTickets = new Map();   // ticket -> { code, expires }
 
 app.post("/streamTicket", async function (req, res) {
-    const code = authOrganizer(req, res);
+    const code = authScreen(req, res);
     if (code == null) return;
     const now = Date.now();
     for (const [t, v] of streamTickets) {
@@ -586,29 +677,39 @@ app.post("/streamTicket", async function (req, res) {
     }
     const ticket = crypto.randomBytes(32).toString("hex");
     // Pin the ticket to this event's identity, not just its code: a purged event's code can be
-    // handed to a different organizer within the ticket's lifetime.
+    // handed to a different organizer within the ticket's lifetime. A ticket bought with a
+    // screen key only opens the big screen's stream, and dies with that key.
     const t = tokens[code];
-    streamTickets.set(ticket, { code, slack: t.slack, password: t.password, expires: now + STREAM_TICKET_TTL });
+    const screenOnly = req.body.password == null;
+    streamTickets.set(ticket, {
+        code,
+        slack: t.slack,
+        secret: screenOnly ? t.screenKey : t.password,
+        screenOnly,
+        expires: now + STREAM_TICKET_TTL
+    });
     return res.status(200).json({ ticket });
 });
 
 // Spends a stream ticket. Sends the error response itself and returns null on failure,
 // otherwise returns the organizer's code.
-function redeemTicket(req, res) {
+function redeemTicket(req, res, { allowScreen = false } = {}) {
     const ticket = req.query.ticket != null ? String(req.query.ticket) : "";
     const entry = ticket ? streamTickets.get(ticket) : undefined;
     if (entry) streamTickets.delete(ticket);
-    if (!entry || entry.expires <= Date.now()) {
+    if (!entry || entry.expires <= Date.now() || (entry.screenOnly && !allowScreen)) {
         res.status(401).json({ error: "Invalid or expired stream ticket" });
         return null;
     }
     const code = entry.code;
     // The event may have been banned, purged and re-issued, or replaced since the ticket was issued.
     const token = getToken(code);
-    if (!token || token.slack !== entry.slack || token.password !== entry.password || isBanned(token.slack)) {
+    const secret = token && (entry.screenOnly ? token.screenKey : token.password);
+    if (!token || token.slack !== entry.slack || !secret || secret !== entry.secret || isBanned(token.slack)) {
         res.status(401).json({ error: "Invalid event code or password" });
         return null;
     }
+    req.screenOnly = entry.screenOnly;
     return code;
 }
 
@@ -620,8 +721,8 @@ app.get("/orgStream", async function (req, res) {
     if (!orgStreams.has(code)) orgStreams.set(code, new Set());
     orgStreams.get(code).add(res);
     sseWrite(res, { type: "state", reason: "connected", state: mergeState(code) });
-    sseWrite(res, { type: "demo", demo: demoState(code) });
-    sseWrite(res, { type: "harpa", harpa: harpaState(code) });
+    sseWrite(res, { type: "demo", demo: demoState(getRootCode(code)) });
+    sseWrite(res, { type: "harpa", harpa: harpaState(getRootCode(code)) });
 
     res.on("close", () => {
         const set = orgStreams.get(code);
@@ -634,87 +735,6 @@ app.get("/orgStream", async function (req, res) {
 app.post("/mergeState", async function (req, res) {
     const code = authOrganizer(req, res);
     if (code == null) return;
-    return res.status(200).json(mergeState(code));
-});
-
-app.post("/mergeRequest", async function (req, res) {
-    const code = authOrganizer(req, res);
-    if (code == null) return;
-    const destination = req.body.destination != null ? String(req.body.destination).trim() : "";
-
-    if (!destination) {
-        return res.status(400).json({ error: "Missing destination code" });
-    }
-    if (destination === code) {
-        return res.status(400).json({ error: "You can't merge an event into itself" });
-    }
-    if (!getToken(destination) || isBanned(tokens[destination].slack)) {
-        return res.status(404).json({ error: "No event found with that code" });
-    }
-    if (tokens[code].bridge) {
-        return res.status(409).json({ error: "Your event is already merged into another event. Leave that merge first." });
-    }
-    if (getMembers(code).length > 0) {
-        return res.status(409).json({ error: "Other events are merged into yours. Remove them before merging into another event." });
-    }
-    if (tokens[destination].bridge) {
-        return res.status(409).json({ error: "That event is itself merged into another event. Request to merge into its host event instead." });
-    }
-
-    const existing = mergeRequests.get(code);
-    if (existing) {
-        if (existing.to === destination) {
-            return res.status(200).json(mergeState(code));
-        }
-        return res.status(409).json({ error: "You already have a pending merge request. Cancel it first." });
-    }
-
-    mergeRequests.set(code, { from: code, to: destination, createdAt: Date.now() });
-    notifyOrg(code, "request_sent");
-    notifyOrg(destination, "request_received");
-    logAs(code, `Requesting merge into ${destination}`);
-    return res.status(200).json(mergeState(code));
-});
-
-app.post("/cancelMergeRequest", async function (req, res) {
-    const code = authOrganizer(req, res);
-    if (code == null) return;
-    if (!mergeRequests.has(code)) {
-        return res.status(404).json({ error: "No pending merge request" });
-    }
-    dropRequest(code, "request_cancelled");
-    logAs(code, "Cancelled outgoing merge request");
-    return res.status(200).json(mergeState(code));
-});
-
-app.post("/respondMergeRequest", async function (req, res) {
-    const code = authOrganizer(req, res);
-    if (code == null) return;
-    const requester = req.body.requester != null ? String(req.body.requester) : "";
-    const { accept } = req.body;
-    if (!requester || typeof accept !== "boolean") {
-        return res.status(400).json({ error: "Missing requester or accept flag" });
-    }
-
-    const request = mergeRequests.get(requester);
-    if (!request || request.to !== code) {
-        return res.status(404).json({ error: "This request no longer exists. It may have been cancelled." });
-    }
-
-    if (!accept) {
-        dropRequest(requester, "request_rejected");
-        logAs(code, `Rejected merge request from ${requester}`);
-        return res.status(200).json(mergeState(code));
-    }
-
-    // Invariants should already guarantee these; re-check rather than create a chain.
-    if (tokens[code].bridge || tokens[requester].bridge || getMembers(requester).length > 0) {
-        dropRequest(requester, "target_unavailable");
-        return res.status(409).json({ error: "This merge is no longer possible. The request has been removed." });
-    }
-
-    mergeInto(code, requester);
-    logAs(code, `Accepted merge of ${requester}`);
     return res.status(200).json(mergeState(code));
 });
 
@@ -736,6 +756,96 @@ app.post("/unmerge", async function (req, res) {
     }
     unmerge(target, "member_removed");
     logAs(code, `Removed ${target} from merge`);
+    return res.status(200).json(mergeState(code));
+});
+
+// --- Merge invites: a host adds organizers by Slack ID ---
+
+const INVITES_MAX = 25;
+
+app.post("/mergeInvite", async function (req, res) {
+    const code = authOrganizer(req, res);
+    if (code == null) return;
+    const slack = req.body.slack != null ? String(req.body.slack).trim().toUpperCase() : "";
+
+    if (!/^[UW][A-Z0-9]{6,15}$/.test(slack)) {
+        return res.status(400).json({ error: "That doesn't look like a Slack member ID. They start with U, like U0123ABCD." });
+    }
+    if (slack === tokens[code].slack) {
+        return res.status(400).json({ error: "That's your own Slack ID." });
+    }
+    if (isBanned(slack)) {
+        return res.status(403).json({ error: "You can't add that person." });
+    }
+    const root = getRootCode(code);
+    const target = eventBySlack(slack);
+    if (target && getRootCode(target) === root) {
+        return res.status(409).json({ error: `${tokens[target].name} is already an organizer here.` });
+    }
+    if (mergeInvites.has(inviteKey(root, slack))) {
+        return res.status(200).json(mergeState(code));
+    }
+    if (invitesFrom(root).length >= INVITES_MAX) {
+        return res.status(409).json({ error: `You can have up to ${INVITES_MAX} invites waiting. Cancel some first.` });
+    }
+
+    mergeInvites.set(inviteKey(root, slack), { from: root, slack, createdAt: Date.now() });
+    notifyGroup(root, "invite_sent");
+    if (target) notifyOrg(target, "invite_received");
+    logAs(code, `Invited ${slack} to organize ${root}`);
+    return res.status(200).json(mergeState(code));
+});
+
+app.post("/cancelMergeInvite", async function (req, res) {
+    const code = authOrganizer(req, res);
+    if (code == null) return;
+    const slack = req.body.slack != null ? String(req.body.slack).trim().toUpperCase() : "";
+    const root = getRootCode(code);
+    const inv = mergeInvites.get(inviteKey(root, slack));
+    if (!inv) {
+        return res.status(404).json({ error: "That invite no longer exists." });
+    }
+    dropInvite(inv, null, "invite_cancelled");
+    notifyGroup(root, "invite_withdrawn");
+    logAs(code, `Cancelled invite to ${slack}`);
+    return res.status(200).json(mergeState(code));
+});
+
+app.post("/respondMergeInvite", async function (req, res) {
+    const code = authOrganizer(req, res);
+    if (code == null) return;
+    const host = req.body.host != null ? String(req.body.host) : "";
+    const { accept } = req.body;
+    if (!host || typeof accept !== "boolean") {
+        return res.status(400).json({ error: "Missing host or accept flag" });
+    }
+
+    const inv = mergeInvites.get(inviteKey(host, tokens[code].slack));
+    if (!inv) {
+        return res.status(404).json({ error: "This invite no longer exists. It may have been cancelled." });
+    }
+
+    if (!accept) {
+        dropInvite(inv, null, null);
+        notifyGroup(host, "invite_declined");
+        logAs(code, `Declined invite from ${host}`);
+        return res.status(200).json(mergeState(code));
+    }
+
+    const hostToken = getToken(host);
+    if (!hostToken || hostToken.bridge || isBanned(hostToken.slack)) {
+        dropInvite(inv, "invite_unavailable", null);
+        return res.status(409).json({ error: "This invite is no longer valid." });
+    }
+    if (tokens[code].bridge) {
+        return res.status(409).json({ error: "You already organize another event. Leave it first." });
+    }
+    if (getMembers(code).length > 0) {
+        return res.status(409).json({ error: "Other organizers are on your event. Remove them before joining another." });
+    }
+
+    mergeInto(host, code);
+    logAs(code, `Accepted invite from ${host}`);
     return res.status(200).json(mergeState(code));
 });
 
@@ -783,9 +893,11 @@ const isLive = (p) => !!(p && p.picked && p.res);
 // What organizers and the projector see. Tokens never leave this file.
 function demoState(code) {
     const d = demos.get(code);
-    if (!d) return { enabled: false, board: true, mirror: false, screenCode: null, screenOpen: false, presenter: null, queue: [] };
+    const paired = !!(tokens[code] && tokens[code].screenKey);
+    if (!d) return { enabled: false, board: true, mirror: false, screenCode: null, screenOpen: false, paired, presenter: null, queue: [] };
     const p = d.presenter;
     return {
+        paired,   // some computer has been paired: the console offers to sign them out
         enabled: d.enabled,
         board: d.board,
         mirror: d.mirror,
@@ -798,7 +910,9 @@ function demoState(code) {
 
 function notifyDemo(code) {
     const payload = { type: "demo", demo: demoState(code) };
-    for (const res of orgStreams.get(code) || []) sseWrite(res, payload);
+    for (const c of groupCodes(code)) {
+        for (const res of orgStreams.get(c) || []) sseWrite(res, payload);
+    }
     const d = demos.get(code);
     if (!d) return;
     if (d.screen) sseWrite(d.screen, payload);
@@ -916,13 +1030,13 @@ function kickAttendee(slack) {
 }
 
 app.post("/demoState", async function (req, res) {
-    const code = authOrganizer(req, res);
+    const code = authEvent(req, res);
     if (code == null) return;
     return res.status(200).json({ demo: demoState(code) });
 });
 
 app.post("/demoSet", async function (req, res) {
-    const code = authOrganizer(req, res);
+    const code = authEvent(req, res);
     if (code == null) return;
     const { enabled, board, mirror } = req.body;
     if ((enabled != null && typeof enabled !== "boolean") || (board != null && typeof board !== "boolean") ||
@@ -938,12 +1052,12 @@ app.post("/demoSet", async function (req, res) {
             dropViewers(code, "mirror_off");
         }
         notifyDemo(code);
-        logAs(code, `Turned the attendee mirror ${mirror ? "on" : "off"}`);
+        logAs(req.actor || code, `Turned the attendee mirror ${mirror ? "on" : "off"}`);
     }
     if (board != null && d.board !== board) {
         d.board = board;
         notifyDemo(code);
-        logAs(code, `Turned the big screen board ${board ? "on" : "off"}`);
+        logAs(req.actor || code, `Turned the big screen board ${board ? "on" : "off"}`);
     }
     if (enabled != null && d.enabled !== enabled) {
         d.enabled = enabled;
@@ -954,9 +1068,9 @@ app.post("/demoSet", async function (req, res) {
             endPresenter(code, "demos_off");
             clearQueue(code, "demos_off");
         }
-        pushToParticipants([code]);
+        pushToParticipants(groupCodes(code));
         notifyDemo(code);
-        logAs(code, `Turned demo time ${enabled ? "on" : "off"}`);
+        logAs(req.actor || code, `Turned demo time ${enabled ? "on" : "off"}`);
     }
     return res.status(200).json({ demo: demoState(code) });
 });
@@ -982,11 +1096,11 @@ function clearFrame(code) {
     const d = demos.get(code);
     if (!d || !d.frame) return;
     d.frame = null;
-    pushToParticipants([code]);
+    pushToParticipants(groupCodes(code));
 }
 
 app.post("/demoFrame", express.json({ limit: "600kb" }), async function (req, res) {
-    const code = authOrganizer(req, res);
+    const code = authEventScreen(req, res);
     if (code == null) return;
     const d = demos.get(code);
     if (!d || !d.enabled || !d.mirror || !isLive(d.presenter)) {
@@ -1003,13 +1117,13 @@ app.post("/demoFrame", express.json({ limit: "600kb" }), async function (req, re
     const now = Date.now();
     if (d.frame && now - d.frame.at < FRAME_MIN_GAP) return res.status(429).json({ error: "Too many frames" });
     d.frame = { n: (d.frame ? d.frame.n : 0) + 1, buf, at: now };
-    pushToParticipants([code]);
+    pushToParticipants(groupCodes(code));
     return res.status(200).json({ n: d.frame.n });
 });
 
 // Public, like /getSession: anyone with the event code can watch the big screen's demo.
 app.get("/demoFrame", async function (req, res) {
-    const code = req.query.code != null ? String(req.query.code) : "";
+    const code = req.query.code != null ? rootOf(req.query.code) : "";
     const d = getToken(code) ? demos.get(code) : null;
     if (!mirrorState(code)) return res.status(404).json({ error: "Nothing is being mirrored" });
     // The URL carries the frame number, so any one frame never changes.
@@ -1050,7 +1164,7 @@ function dropViewers(code, reason) {
 const validViewer = (id) => typeof id === "string" && /^[A-Za-z0-9-]{8,64}$/.test(id);
 
 app.get("/mirrorStream", async function (req, res) {
-    const code = req.query.code != null ? String(req.query.code) : "";
+    const code = req.query.code != null ? rootOf(req.query.code) : "";
     const viewer = req.query.viewer;
     if (!getToken(code) || !validViewer(viewer)) return res.status(400).json({ error: "Bad request" });
     const d = demos.get(code);
@@ -1075,7 +1189,7 @@ app.get("/mirrorStream", async function (req, res) {
 // A watcher's handshake message (their offer or ICE candidates) on its way to the projector.
 app.post("/mirrorSignal", async function (req, res) {
     const body = req.body || {};
-    const code = body.code != null ? String(body.code) : "";
+    const code = body.code != null ? rootOf(body.code) : "";
     const d = getToken(code) ? demos.get(code) : null;
     if (!validViewer(body.viewer) || !validSignal(body.signal)) return res.status(400).json({ error: "Invalid signal" });
     if (!d || !d.viewers.has(body.viewer) || !mirrorLive(d)) return res.status(409).json({ delivered: false });
@@ -1084,11 +1198,11 @@ app.post("/mirrorSignal", async function (req, res) {
 });
 
 app.post("/demoStop", async function (req, res) {
-    const code = authOrganizer(req, res);
+    const code = authEvent(req, res);
     if (code == null) return;
     const d = demos.get(code);
     if (d && d.presenter) {
-        logAs(code, `Stopped ${d.presenter.name}'s screenshare`);
+        logAs(req.actor || code, `Stopped ${d.presenter.name}'s screenshare`);
         endPresenter(code, "stopped");
     }
     return res.status(200).json({ demo: demoState(code) });
@@ -1096,7 +1210,7 @@ app.post("/demoStop", async function (req, res) {
 
 // Hands the big screen to someone in the queue. They still have to pick a window.
 app.post("/demoApprove", async function (req, res) {
-    const code = authOrganizer(req, res);
+    const code = authEvent(req, res);
     if (code == null) return;
     const d = demos.get(code);
     const entry = d && d.queue.find(q => q.id === String(req.body.id ?? ""));
@@ -1125,30 +1239,33 @@ app.post("/demoApprove", async function (req, res) {
         if (d.presenter === entry && !entry.res) endPresenter(code, "lost");
     }, DEMO_GRACE);
     notifyDemo(code);
-    logAs(code, `Approved ${entry.name} for the big screen`);
+    logAs(req.actor || code, `Approved ${entry.name} for the big screen`);
     return res.status(200).json({ demo: demoState(code) });
 });
 
 app.post("/demoRemove", async function (req, res) {
-    const code = authOrganizer(req, res);
+    const code = authEvent(req, res);
     if (code == null) return;
     const d = demos.get(code);
     const entry = d && d.queue.find(q => q.id === String(req.body.id ?? ""));
     if (entry) {
         dropQueued(code, entry, "removed");
-        logAs(code, `Removed ${entry.name} from the demo queue`);
+        logAs(req.actor || code, `Removed ${entry.name} from the demo queue`);
     }
     return res.status(200).json({ demo: demoState(code) });
 });
 
 // The projector tab. One per event: opening a second one takes over from the first.
 app.get("/screenStream", async function (req, res) {
-    const code = redeemTicket(req, res);
-    if (code == null) return;
+    const opener = redeemTicket(req, res, { allowScreen: true });
+    if (opener == null) return;
+    const code = getRootCode(opener);
 
     const d = getDemo(code);
     const previous = d.screen;
     d.screen = res;
+    res.paired = !!req.screenOnly;   // opened with a screen key: unpairing closes it
+    res.openedBy = opener;           // an organizer leaving the event takes their tab with them
     if (previous) sseEnd(previous, { type: "replaced" });
 
     openSSE(res);
@@ -1172,7 +1289,7 @@ const DEMO_QUEUE_MAX = 50;
 // Joins the queue. Needs a typed name and the code on the big screen.
 app.post("/demoJoin", async function (req, res) {
     const body = req.body || {};
-    const code = body.code != null ? String(body.code) : "";
+    const code = body.code != null ? rootOf(body.code) : "";
     const screenCode = body.screenCode != null ? String(body.screenCode).trim() : "";
     if (!code || !screenCode) {
         return res.status(400).json({ error: "Enter the code on the big screen." });
@@ -1231,7 +1348,7 @@ app.post("/demoJoin", async function (req, res) {
     entry.timer = setTimeout(() => dropQueued(code, entry, "lost"), DEMO_PENDING_TTL);
     d.queue.push(entry);
     notifyDemo(code);
-    logAs(code, `${who.name} joined the demo queue`);
+    logAs(req.actor || code, `${who.name} joined the demo queue`);
     return res.status(200).json({ token: entry.token, iceServers });
 });
 
@@ -1239,7 +1356,7 @@ app.post("/demoJoin", async function (req, res) {
 // { type: "queued", position }, { type: "approved" }, { type: "ready", restart } (start or
 // redo the handshake), { type: "signal", signal } and { type: "ended", reason }.
 app.get("/demoStream", async function (req, res) {
-    const code = req.query.code != null ? String(req.query.code) : "";
+    const code = req.query.code != null ? rootOf(req.query.code) : "";
     const p = demoPresenter(code, req.query.token) || demoQueued(code, req.query.token);
     if (!p) {
         return res.status(401).json({ error: "This screenshare has ended" });
@@ -1283,7 +1400,7 @@ app.get("/demoStream", async function (req, res) {
 // The approved presenter has picked a window: start the handshake with the projector.
 app.post("/demoPicked", async function (req, res) {
     const body = req.body || {};
-    const code = body.code != null ? String(body.code) : "";
+    const code = body.code != null ? rootOf(body.code) : "";
     const p = demoPresenter(code, body.token);
     if (!p) return res.status(401).json({ error: "This screenshare has ended" });
     const d = demos.get(code);
@@ -1297,7 +1414,7 @@ app.post("/demoPicked", async function (req, res) {
 
 app.post("/demoLeave", async function (req, res) {
     const body = req.body || {};
-    const code = body.code != null ? String(body.code) : "";
+    const code = body.code != null ? rootOf(body.code) : "";
     if (demoPresenter(code, body.token)) {
         endPresenter(code, "left");
     } else {
@@ -1308,7 +1425,7 @@ app.post("/demoLeave", async function (req, res) {
 });
 
 // Relays one handshake message. A presenter proves themselves with their token; anything
-// else must be the projector tab, which holds organizer credentials.
+// else must be the projector tab, which holds organizer credentials or a screen key.
 app.post("/demoSignal", async function (req, res) {
     const body = req.body || {};
     if (!validSignal(body.signal)) {
@@ -1316,7 +1433,7 @@ app.post("/demoSignal", async function (req, res) {
     }
 
     if (body.token != null) {
-        const code = body.code != null ? String(body.code) : "";
+        const code = body.code != null ? rootOf(body.code) : "";
         const p = demoPresenter(code, body.token);
         if (!p || !p.picked) return res.status(401).json({ error: "This screenshare has ended" });
         const d = demos.get(code);
@@ -1324,7 +1441,7 @@ app.post("/demoSignal", async function (req, res) {
         return res.status(200).json({ delivered: !!d.screen });
     }
 
-    const code = authOrganizer(req, res);
+    const code = authEventScreen(req, res);
     if (code == null) return;
     const d = demos.get(code);
     if (body.viewer != null) {
@@ -1337,6 +1454,78 @@ app.post("/demoSignal", async function (req, res) {
     const delivered = !!(p && p.res && p.id === body.to);
     if (delivered) sseWrite(p.res, { type: "signal", signal: body.signal });
     return res.status(200).json({ delivered });
+});
+
+// --- Screen pairing: the big screen on a computer nobody signs in on ---
+//
+// Venue computers shouldn't hold an organizer's Hack Club sign-in. The console asks for a
+// short-lived pairing code; typing it at /screen trades it for the event's screen key, which
+// only runs the big screen (/streamTicket for /screenStream, /demoSignal, /demoFrame).
+// Unpairing replaces the key, which signs every paired computer out.
+
+const PAIR_TTL = 10 * 60 * 1000;
+
+function newPairCode() {
+    let p;
+    do p = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+    while (pairCodes.has(p));
+    return p;
+}
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [p, v] of pairCodes) {
+        if (v.expires <= now) pairCodes.delete(p);
+    }
+}, 60 * 1000).unref();
+
+app.post("/screenPairCode", async function (req, res) {
+    const code = authEvent(req, res);
+    if (code == null) return;
+    // One live pairing code per event: asking again replaces it.
+    for (const [p, v] of pairCodes) {
+        if (v.code === code) pairCodes.delete(p);
+    }
+    tokens[code].screenKey ??= crypto.randomBytes(32).toString("hex");
+    const pairCode = newPairCode();
+    const expires = Date.now() + PAIR_TTL;
+    pairCodes.set(pairCode, { code, expires });
+    notifyDemo(code);
+    logAs(req.actor || code, "Created a screen pairing code");
+    return res.status(200).json({ pairCode, expires });
+});
+
+app.post("/screenPair", async function (req, res) {
+    const pairCode = req.body && req.body.pairCode != null ? String(req.body.pairCode).replace(/\D/g, "") : "";
+    const callerKey = `pair|${req.ip}`;
+    if (recentFailures(callerKey).length >= 5 || recentFailures("pair").length >= 60) {
+        return res.status(429).json({ error: "Too many wrong codes. Wait a minute and try again." });
+    }
+    const entry = pairCodes.get(pairCode);
+    const token = entry && entry.expires > Date.now() ? getToken(entry.code) : undefined;
+    if (!token || !token.screenKey || isBanned(token.slack)) {
+        for (const key of [callerKey, "pair"]) {
+            demoFailures.set(key, [...recentFailures(key), Date.now()]);
+        }
+        return res.status(401).json({ error: "That code didn't work. Codes last 10 minutes; get a new one from the organizer console." });
+    }
+    pairCodes.delete(pairCode);
+    logAs(entry.code, "Paired a big screen");
+    return res.status(200).json({ code: entry.code, screenKey: token.screenKey });
+});
+
+app.post("/screenUnpair", async function (req, res) {
+    const code = authEvent(req, res);
+    if (code == null) return;
+    delete tokens[code].screenKey;
+    for (const [p, v] of pairCodes) {
+        if (v.code === code) pairCodes.delete(p);
+    }
+    const d = demos.get(code);
+    if (d && d.screen && d.screen.paired) sseEnd(d.screen, { type: "revoked", reason: "unpaired" });
+    notifyDemo(code);
+    logAs(req.actor || code, "Unpaired all big screens");
+    return res.status(200).json({ message: "Paired screens signed out" });
 });
 
 // --- Admin ---
@@ -1412,7 +1601,8 @@ app.post("/setEvents", async function (req, res) {
     }
 
     normalizeMerges();
-    mergeRequests.clear();
+    mergeInvites.clear();
+    pairCodes.clear();
     streamTickets.clear();
     sessions = {};
 
@@ -1440,6 +1630,8 @@ app.post("/banEvent", async function (req, res) {
                 purgeEvent(jumbotronCode, { error: "User banned by administrator" });
             }
         }
+        // Invites waiting for someone who never signed in.
+        for (const inv of invitesTo(targetSlack)) dropInvite(inv, "invite_unavailable", null);
         if (!banned.includes(targetSlack)) {
             banned.push(targetSlack);
         }
@@ -1503,7 +1695,7 @@ function harpaState(code) {
 }
 
 app.post("/harpaSet", async function (req, res) {
-    const code = authOrganizer(req, res);
+    const code = authEvent(req, res);
     if (code == null) return;
     const enabled = req.body && req.body.enabled;
     if (typeof enabled !== "boolean") return res.status(400).json({ error: "Send enabled as true or false" });
@@ -1511,10 +1703,12 @@ app.post("/harpaSet", async function (req, res) {
         if (enabled) harpaOn.add(code);
         else harpaOn.delete(code);
         const payload = { type: "harpa", harpa: harpaState(code) };
-        for (const s of orgStreams.get(code) || []) sseWrite(s, payload);
+        for (const c of groupCodes(code)) {
+            for (const s of orgStreams.get(c) || []) sseWrite(s, payload);
+        }
         const d = demos.get(code);
         if (d && d.screen) sseWrite(d.screen, payload);
-        logAs(code, `Turned harpa ${enabled ? "on" : "off"}`);
+        logAs(req.actor || code, `Turned harpa ${enabled ? "on" : "off"}`);
     }
     return res.status(200).json({ harpa: harpaState(code) });
 });
